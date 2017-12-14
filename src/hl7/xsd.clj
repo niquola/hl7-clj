@@ -170,7 +170,6 @@
   :default [acc _] acc)
 
 (defn state-name [path seg]
-  (println "st-name" path seg)
   (->>
    (into (conj (mapv name path) (name (or (:name seg) (:seg seg)))))
    (str/join "-" )
@@ -178,15 +177,28 @@
 
 (state-name [] {:seg :PID})
 
-(defn forward-transitions [segs-tail path]
+(defn forward-transitions [segs-tail path & [coll]]
   (->> segs-tail
        (take-until :required)
        (reduce (fn [acc s]
-                 (println "S:" s)
                  (if (:seg s)
-                   (assoc acc (:seg s) (cond-> {:next (state-name path s)}
-                                         (not (empty? path)) (assoc :path path)))
-                   (merge acc (forward-transitions (:segments s) (conj path (:name s))))
+                   (assoc acc (keyword (:seg s)) (cond-> {:next (state-name path s)}
+                                                   (not (empty? path)) (assoc :path path)
+                                                   (or coll (:collection s)) (assoc :collection true)))
+                   (merge acc (forward-transitions (:segments s) (conj path (:name s)) (:collection s)))
+                   )) {})))
+
+(defn backward-transitions [segs path {ss :stop-segment sp :stop-path :as opts}]
+  (->> segs
+       (take-until (fn [x] (or (:required x) #_(and (= ss x) (= sp path)))))
+       (reduce (fn [acc s]
+                 (if (:seg s)
+                   (assoc acc (keyword (:seg s)) (cond-> {:next (state-name path s)
+                                                          :back true
+                                                          :path path
+                                                          :collection true}
+                                                   (not (empty? path)) (assoc :path path)))
+                   (merge acc (backward-transitions (:segments s) (conj path (:name s)) opts))
                    )) {})))
 
 
@@ -210,40 +222,47 @@
 
 (defmethod reduce-machine
   :segment
-  [acc {{seg-nm :seg :as cur-seg} :current-seg
+  [acc {{seg-nm :seg col :collection :as cur-seg} :current-seg
         path :path
-        backward-transitions :backward-transitions
+        bwt :backward-transitions
         segs-tail :segments-rest
         :as opts}]
-  (let [transitions (apply merge (forward-transitions segs-tail path) backward-transitions)
+  (let [transitions (apply merge
+                           (conj bwt
+                                 (if col {(keyword seg-nm) {:next (state-name path cur-seg)
+                                                            :path path
+                                                            :back true
+                                                            :collection true}} {})
+                                 (forward-transitions segs-tail path)))
         acc (assoc acc (state-name path cur-seg) transitions)]
     (reduce-tail acc opts)))
 
 (defmethod reduce-machine
   :group
   [acc {sm-state :sm-state
-        {seg-nm :name :as cur-seg} :current-seg
+        {seg-nm :name coll :collection :as cur-seg} :current-seg
         path :path
-        backward-transitions :backward-transitions
+        bwt :backward-transitions
         segs-tail :segments-rest
         :as opts}]
-  (let [transitions (apply merge (forward-transitions segs-tail path) backward-transitions)
+  (let [transitions (apply merge (conj bwt (forward-transitions segs-tail path)))
         acc (reduce-tail acc opts)]
     (loop [acc acc [s & ss] (:segments cur-seg)]
       (if (nil? s)
         acc
-        (let [acc (let [next-state (state-name path s)
-                        new-path (conj path (:name cur-seg))]
-                    (if-not (get acc next-state)
-                      (-> acc
-                          (assoc (state-name new-path s) transitions)
-                          (reduce-machine (assoc opts
-                                                 :sm-state next-state
-                                                 :path (conj path (:name cur-seg))
-                                                 :backward-transitions (conj backward-transitions transitions)
-                                                 :current-seg s
-                                                 :segments-rest ss)))
-                      acc))]
+        (let [next-state (state-name path s)
+              new-path (conj path (:name cur-seg))
+              btrs     (if coll (backward-transitions (:segments cur-seg) new-path {:stop-segment s :stop-path new-path}) {})
+              acc (if-not (get acc next-state)
+                    (-> acc
+                        (assoc (state-name new-path s) transitions)
+                        (reduce-machine (assoc opts
+                                               :sm-state next-state
+                                               :path (conj path (:name cur-seg))
+                                               :backward-transitions (into bwt [transitions btrs])
+                                               :current-seg s
+                                               :segments-rest ss)))
+                    acc)]
           (if-not (:required s) (recur acc ss) acc))))))
 
 (defn state-machine [msg]
@@ -255,13 +274,48 @@
                    :segments-rest (into [] (conj (:segments msg) {:seg :end}))}))
 
 
-(dump (state-machine (get-in metadata [:messages "ADT_A01"])))
+(def mt (get-in metadata [:messages "ORU_R01"]))
+
+(def sm (state-machine mt))
+
+(dump {:msg mt :sm sm})
+
+(:start sm)
+
+(defn test-parse [segs sm]
+  (reduce (fn [state s]
+            (let [tr (get sm state)
+                  next-tr (get tr s)]
+              (println
+               (str
+                ;; (str/join (repeat (count (:path next-tr)) " "))
+                #_(when (or (:collection next-tr) (:back next-tr)) "* ")
+                (str/join "." (conj (:path next-tr) (name s)))
+                " "
+                (select-keys next-tr [:collection :back])
+                ))
+              (or (:next next-tr) state)))
+          :start segs))
+
+
+(def tmsg  [:MSH :PID :NK1 :PV1 :PV2
+            :OBR :NTE :OBX :OBX :OBX
+            :ORC :OBR :OBX :NTE :NTE
+            :OBR :NTE :NTE :TQ1 :TQ2 :TQ2 :CTD
+              :OBX :NTE :NTE :CTI :SPM :OBX :OBX :SPM
+            :PID :OBR :OBX
+            :PID :OBR :OBX :OBR :OBX
+            :DSC
+            ])
+
+
+(test-parse tmsg sm)
 
 (comment
 
-  (defn dump [x]
-    (spit "/tmp/hl7.yaml" (yaml/generate-string x)))
+  (defn dump [x] (spit "/tmp/hl7.yaml" (yaml/generate-string x)))
 
+  (dump (state-machine (get-in metadata [:messages "ADT_A01"])))
   (defonce metadata (load "2.5.1"))
 
   #_{:sch (get-in metadata [:messages "ADT_A01"])}
@@ -288,3 +342,13 @@
 
 
 )
+(comment
+
+  (require '[cheshire.core])
+
+  (def bndl (cheshire.core/parse-string (slurp "/Users/nicola/Downloads/fhir/Abbott657_Deann989_30.json") keyword))
+
+  (spit "/tmp/abb.yaml" (clj-yaml.core/generate-string (mapv :resource (:entry bndl))))
+  
+
+  )
