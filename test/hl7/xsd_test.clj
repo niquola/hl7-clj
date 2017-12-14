@@ -17,6 +17,4 @@
                                                   {:seg "y"}]}
                             {:seg "d" :required true}
                             {:seg "e"}] [])
-
-
   )

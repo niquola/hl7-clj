@@ -158,8 +158,7 @@
         (recur (conj acc x) xs)))))
 
 (defmulti reduce-machine
-  (fn [acc {sm-state :sm-state
-            cur-seg :current-seg
+  (fn [acc {cur-seg :current-seg
             segs-tail :segments-rest}]
     (cond
       (:seg cur-seg)  :segment
@@ -172,7 +171,7 @@
 (defn state-name [path seg]
   (->>
    (into (conj (mapv name path) (name (or (:name seg) (:seg seg)))))
-   (str/join "-" )
+   (str/join "." )
    (keyword)))
 
 (state-name [] {:seg :PID})
@@ -190,57 +189,47 @@
 
 (defn backward-transitions [segs path {ss :stop-segment sp :stop-path :as opts}]
   (->> segs
-       (take-until (fn [x] (or (:required x) #_(and (= ss x) (= sp path)))))
+       ;; (take-until (fn [x] (or (:required x) #_(and (= ss x) (= sp path)))))
+       (take-until :required)
        (reduce (fn [acc s]
                  (if (:seg s)
                    (assoc acc (keyword (:seg s)) (cond-> {:next (state-name path s)
                                                           :back true
-                                                          :path path
                                                           :collection true}
                                                    (not (empty? path)) (assoc :path path)))
                    (merge acc (backward-transitions (:segments s) (conj path (:name s)) opts))
                    )) {})))
 
-
-(defn reduce-tail [acc
-                   {path :path
-                    transitions :backward-transitions
-                    segs-tail :segments-rest
-                    :as opts}]
-  (loop [acc acc [s & ss] segs-tail]
+(defn reduce-tail [acc {path :path segs :segments-rest :as opts}]
+  (loop [acc acc, [s & ss] segs]
     (if (nil? s)
       acc
-      (let [acc (let [next-state (state-name path s)]
-                  (if-not (get acc next-state)
-                    (reduce-machine acc (assoc opts
-                                               :sm-state next-state
-                                               :backward-transitions transitions
-                                               :current-seg s
-                                               :segments-rest ss))
-                    acc))]
+      (let [acc (reduce-machine acc (assoc opts :current-seg s :segments-rest ss))]
         (if-not (:required s) (recur acc ss) acc)))))
+
+(defn collection-transitions [path {seg-nm :seg col :collection :as seg}]
+  (if-not col
+    {} {(keyword seg-nm) {:next (state-name path seg)
+                          :path path
+                          :back true
+                          :collection true}}))
 
 (defmethod reduce-machine
   :segment
-  [acc {{seg-nm :seg col :collection :as cur-seg} :current-seg
+  [acc {cur-seg :current-seg
         path :path
         bwt :backward-transitions
         segs-tail :segments-rest
         :as opts}]
-  (let [transitions (apply merge
-                           (conj bwt
-                                 (if col {(keyword seg-nm) {:next (state-name path cur-seg)
-                                                            :path path
-                                                            :back true
-                                                            :collection true}} {})
-                                 (forward-transitions segs-tail path)))
-        acc (assoc acc (state-name path cur-seg) transitions)]
-    (reduce-tail acc opts)))
+  (-> acc
+      (assoc (state-name path cur-seg) (-> (apply merge bwt)
+                                           (merge (collection-transitions path cur-seg))
+                                           (merge (forward-transitions segs-tail path))))
+      (reduce-tail opts)))
 
 (defmethod reduce-machine
   :group
-  [acc {sm-state :sm-state
-        {seg-nm :name coll :collection :as cur-seg} :current-seg
+  [acc {{seg-nm :name coll :collection :as cur-seg} :current-seg
         path :path
         bwt :backward-transitions
         segs-tail :segments-rest
@@ -257,7 +246,6 @@
                     (-> acc
                         (assoc (state-name new-path s) transitions)
                         (reduce-machine (assoc opts
-                                               :sm-state next-state
                                                :path (conj path (:name cur-seg))
                                                :backward-transitions (into bwt [transitions btrs])
                                                :current-seg s
@@ -267,11 +255,12 @@
 
 (defn state-machine [msg]
   (reduce-machine {}
-                  {:sm-state :start
-                   :current-seg {:seg :start}
+                  {:current-seg {:seg :start}
                    :path []
                    :backward-transitions []
                    :segments-rest (into [] (conj (:segments msg) {:seg :end}))}))
+
+;; nice 275 lines of code :I
 
 
 (def mt (get-in metadata [:messages "ORU_R01"]))
